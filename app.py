@@ -150,7 +150,78 @@ div[data-testid="stAlert"] {
 </style>
 """, unsafe_allow_html=True)
 
-archivo = "INVENTARIO.xlsx"
+# Archivos de inventario
+ARCHIVO_TALLER = "INVENTARIO.xlsx"
+ARCHIVO_MAQUINAS = "TALLER MÁQUINAS.xlsx"
+
+# Cada ubicación de la aplicación apunta a un Excel y a una hoja concreta.
+# Las ubicaciones antiguas conservan exactamente su nombre.
+FUENTES = {
+    ARCHIVO_TALLER: {
+        "Taller general": {
+            "Armario 1": "Armario 1",
+            "Armario 2": "Armario 2",
+            "Armario 3": "Armario 3",
+            "Suelo y pared": "Suelo y pared",
+            "Estantería grande": "Estantería grande",
+            "Estantería esquina": "Estantería esquina",
+        }
+    },
+    ARCHIVO_MAQUINAS: {
+        "Taller máquinas": {
+            "Armario": "Armario",
+            "Cajones mesa": "Cajones mesa ",
+        }
+    },
+}
+
+# Mapa de cada sala y sus zonas.
+# Una sala puede tener VARIAS hojas Excel, por eso no guardamos una sola
+# hoja por ubicación: la hoja correcta se determina a partir de la zona
+# incluida en la posición mostrada en pantalla.
+UBICACIONES_A_ARCHIVO = {}
+for archivo_fuente, salas in FUENTES.items():
+    for ubicacion_app, zonas in salas.items():
+        UBICACIONES_A_ARCHIVO[ubicacion_app] = archivo_fuente
+
+ZONAS_POR_UBICACION = {
+    ubicacion: list(zonas.keys())
+    for salas in FUENTES.values()
+    for ubicacion, zonas in salas.items()
+}
+
+# Para poder guardar correctamente en Excel, la pantalla muestra
+# "zona | posición", mientras que en el Excel solo se escribe la posición real.
+def zona_de_posicion(posicion):
+    texto = limpiar_texto(posicion)
+    if " | " in texto:
+        return texto.split(" | ", 1)[0].strip()
+    return ""
+
+def posicion_para_excel(posicion):
+    texto = limpiar_texto(posicion)
+    if " | " in texto:
+        return texto.split(" | ", 1)[1].strip()
+    return texto
+
+def contexto_ubicacion(ubicacion, posicion=""):
+    archivo = UBICACIONES_A_ARCHIVO.get(ubicacion)
+    if not archivo:
+        return None
+
+    zonas = FUENTES.get(archivo, {}).get(ubicacion, {})
+    zona = zona_de_posicion(posicion)
+
+    if zona and zona in zonas:
+        return archivo, zonas[zona]
+
+    # Si la sala solo tiene una zona, podemos resolverla sin prefijo.
+    if len(zonas) == 1:
+        return archivo, next(iter(zonas.values()))
+
+    # En salas con varias hojas es obligatorio conocer la zona.
+    return None
+
 
 
 # =====================================================
@@ -181,27 +252,43 @@ def limpiar_cantidad(valor):
     if texto.endswith(".0"):
         texto = texto[:-2]
 
+    # En pantalla mostramos solo el número cuando el Excel trae
+    # formatos como "2 cajas", "30 unidades" o "7 (4 sin abrir)".
+    coincidencia = re.match(r"^(\d+(?:[.,]\d+)?)", texto)
+    if coincidencia:
+        numero = coincidencia.group(1).replace(",", ".")
+        try:
+            numero_float = float(numero)
+            return str(int(numero_float)) if numero_float.is_integer() else str(numero_float)
+        except ValueError:
+            pass
+
     return texto
 
 
 # =====================================================
-# LEER EL EXCEL
+# LEER LOS DOS EXCEL
 # =====================================================
-
-excel = pd.ExcelFile(archivo)
 
 tablas = []
 
-for hoja in excel.sheet_names:
+for archivo_fuente, salas in FUENTES.items():
+    for ubicacion_app, zonas in salas.items():
+        for zona, hoja in zonas.items():
+            datos = pd.read_excel(
+                archivo_fuente,
+                sheet_name=hoja
+            )
 
-    datos = pd.read_excel(
-        archivo,
-        sheet_name=hoja
-    )
-
-    datos["Ubicación"] = hoja
-
-    tablas.append(datos)
+            datos["Ubicación"] = ubicacion_app
+            datos["Zona"] = zona
+            datos["__archivo"] = archivo_fuente
+            datos["__hoja"] = hoja
+            if "Cantidad" in datos.columns:
+                datos["__cantidad_raw"] = datos["Cantidad"].apply(limpiar_texto)
+            else:
+                datos["__cantidad_raw"] = ""
+            tablas.append(datos)
 
 
 inventario = pd.concat(
@@ -644,7 +731,16 @@ for indice in inventario.index:
         else:
             inventario.at[indice, "Unidad"] = "cajas"
 
-    # PRIORIDAD 2: tornillería -> cajas.
+    # PRIORIDAD 2: si el Excel original dice explícitamente "caja/cajas",
+    # mantenemos esa unidad. Esto cubre, por ejemplo, Taller máquinas.
+    cantidad_raw = limpiar_texto(inventario.at[indice, "__cantidad_raw"])
+    if re.search(r"\bcajas?\b", cantidad_raw, flags=re.IGNORECASE):
+        numero = numero_de_cantidad(cantidad_actual)
+        inventario.at[indice, "Unidad"] = (
+            "caja" if numero == 1 else "cajas"
+        )
+
+    # PRIORIDAD 3: tornillería -> cajas.
     # Incluye artículos identificados como DIN 930, DIN 934, DIN 980, etc.
     # y filas que vienen de la columna "Nombre (tornillería)".
     articulo_actual = limpiar_texto(inventario.at[indice, "Artículo"])
@@ -681,30 +777,29 @@ for indice in inventario.index:
 
 inventario["Posición"] = ""
 
-
 if "Lugar" in inventario.columns:
-
-    lugar = (
-        inventario["Lugar"]
-        .apply(limpiar_texto)
-    )
-
+    lugar = inventario["Lugar"].apply(limpiar_texto)
     inventario["Posición"] = lugar
 
+if "Nº cajón" in inventario.columns:
+    cajon = inventario["Nº cajón"].apply(limpiar_texto)
+    vacias = inventario["Posición"] == ""
+    inventario.loc[vacias, "Posición"] = cajon[vacias]
 
 if "Nº balda" in inventario.columns:
-
-    balda = (
-        inventario["Nº balda"]
-        .apply(limpiar_texto)
-    )
-
+    balda = inventario["Nº balda"].apply(limpiar_texto)
     vacias = inventario["Posición"] == ""
+    inventario.loc[vacias, "Posición"] = balda[vacias]
 
-    inventario.loc[
-        vacias,
-        "Posición"
-    ] = balda[vacias]
+# En pantalla mostramos siempre la zona + la posición concreta.
+# Ejemplo: "Armario 1 | Balda 1" o "Cajones mesa | Cajón 1".
+for indice in inventario.index:
+    zona = limpiar_texto(inventario.at[indice, "Zona"])
+    posicion_actual = limpiar_texto(inventario.at[indice, "Posición"])
+    if zona and posicion_actual:
+        inventario.at[indice, "Posición"] = f"{zona} | {posicion_actual}"
+    elif zona:
+        inventario.at[indice, "Posición"] = zona
 
 
 # =====================================================
@@ -909,12 +1004,17 @@ def _guardar_articulo_excel(nombre, cantidad, unidad, ubicacion, posicion):
     Añade un artículo al Excel o suma la cantidad si ya existe en la misma
     ubicación y posición y la cantidad existente es numérica.
     """
+    contexto = contexto_ubicacion(ubicacion, posicion)
+    if not contexto:
+        return "error_ubicacion"
+
+    archivo, hoja = contexto
     wb = load_workbook(archivo)
 
-    if ubicacion not in wb.sheetnames:
-        wb.create_sheet(ubicacion)
+    if hoja not in wb.sheetnames:
+        return "nuevo"
 
-    ws = wb[ubicacion]
+    ws = wb[hoja]
 
     # Detectar encabezados existentes.
     encabezados = {}
@@ -926,7 +1026,7 @@ def _guardar_articulo_excel(nombre, cantidad, unidad, ubicacion, posicion):
     if "Nombre" in encabezados:
         col_nombre = encabezados["Nombre"]
         col_cantidad = encabezados.get("Cantidad")
-        col_posicion = encabezados.get("Nº balda") or encabezados.get("Lugar")
+        col_posicion = encabezados.get("Nº balda") or encabezados.get("Lugar") or encabezados.get("Nº cajón")
         col_unidad = None
     elif "Nombre (tornillería)" in encabezados:
         col_nombre = encabezados["Nombre (tornillería)"]
@@ -947,6 +1047,8 @@ def _guardar_articulo_excel(nombre, cantidad, unidad, ubicacion, posicion):
         # En esa hoja el inventario está expresado en cajas.
         cantidad_para_excel = cantidad
 
+    posicion_excel = posicion_para_excel(posicion)
+
     # Buscar un artículo existente en la misma ubicación + posición.
     fila_encontrada = None
     for fila in range(2, ws.max_row + 1):
@@ -958,7 +1060,7 @@ def _guardar_articulo_excel(nombre, cantidad, unidad, ubicacion, posicion):
         if (
             limpiar_texto(nombre_existente).casefold() == nombre.strip().casefold()
             and limpiar_texto(posicion_existente).casefold()
-            == posicion.strip().casefold()
+            == posicion_excel.casefold()
         ):
             fila_encontrada = fila
             break
@@ -981,7 +1083,7 @@ def _guardar_articulo_excel(nombre, cantidad, unidad, ubicacion, posicion):
         ws.cell(fila, col_cantidad).value = cantidad
 
     if col_posicion:
-        ws.cell(fila, col_posicion).value = posicion.strip()
+        ws.cell(fila, col_posicion).value = posicion_excel
 
     wb.save(archivo)
     return "nuevo"
@@ -994,12 +1096,18 @@ def _retirar_unidades_excel(nombre, ubicacion, posicion, cantidad):
     if cantidad <= 0:
         return False, "La cantidad debe ser mayor que 0."
 
-    wb = load_workbook(archivo)
-
-    if ubicacion not in wb.sheetnames:
+    contexto = contexto_ubicacion(ubicacion, posicion)
+    if not contexto:
         return False, "No se ha encontrado la ubicación."
 
-    ws = wb[ubicacion]
+    archivo, hoja = contexto
+    wb = load_workbook(archivo)
+
+    if hoja not in wb.sheetnames:
+        return False, "No se ha encontrado la hoja de la ubicación."
+
+    ws = wb[hoja]
+    posicion_excel = posicion_para_excel(posicion)
 
     encabezados = {}
     for celda in ws[1]:
@@ -1007,7 +1115,7 @@ def _retirar_unidades_excel(nombre, ubicacion, posicion, cantidad):
             encabezados[str(celda.value).strip()] = celda.column
 
     col_nombre = encabezados.get("Nombre") or encabezados.get("Nombre (tornillería)")
-    col_posicion = encabezados.get("Nº balda") or encabezados.get("Lugar") or encabezados.get("Unnamed: 0")
+    col_posicion = encabezados.get("Nº balda") or encabezados.get("Lugar") or encabezados.get("Nº cajón") or encabezados.get("Unnamed: 0")
 
     if not col_nombre:
         return False, "No se encuentra la columna del artículo en el Excel."
@@ -1018,7 +1126,7 @@ def _retirar_unidades_excel(nombre, ubicacion, posicion, cantidad):
 
         if (
             nombre_existente.casefold() == nombre.strip().casefold()
-            and posicion_existente.casefold() == posicion.strip().casefold()
+            and posicion_existente.casefold() == posicion_excel.casefold()
         ):
             # Tornillería (Nombre (tornillería) / códigos DIN) y filas que
             # realmente tengan "Nº de cajas" usan esa columna. El resto usa Cantidad.
@@ -1059,12 +1167,18 @@ def _retirar_unidades_excel(nombre, ubicacion, posicion, cantidad):
 
 def _eliminar_articulo_excel(nombre, ubicacion, posicion):
     """Elimina la primera fila que coincida con artículo + posición."""
-    wb = load_workbook(archivo)
-
-    if ubicacion not in wb.sheetnames:
+    contexto = contexto_ubicacion(ubicacion, posicion)
+    if not contexto:
         return False
 
-    ws = wb[ubicacion]
+    archivo, hoja = contexto
+    wb = load_workbook(archivo)
+
+    if hoja not in wb.sheetnames:
+        return False
+
+    ws = wb[hoja]
+    posicion_excel = posicion_para_excel(posicion)
 
     encabezados = {}
     for celda in ws[1]:
@@ -1072,7 +1186,7 @@ def _eliminar_articulo_excel(nombre, ubicacion, posicion):
             encabezados[str(celda.value).strip()] = celda.column
 
     col_nombre = encabezados.get("Nombre") or encabezados.get("Nombre (tornillería)")
-    col_posicion = encabezados.get("Nº balda") or encabezados.get("Lugar") or encabezados.get("Unnamed: 0")
+    col_posicion = encabezados.get("Nº balda") or encabezados.get("Lugar") or encabezados.get("Nº cajón") or encabezados.get("Unnamed: 0")
 
     if not col_nombre:
         return False
@@ -1083,7 +1197,7 @@ def _eliminar_articulo_excel(nombre, ubicacion, posicion):
 
         if (
             nombre_existente.casefold() == nombre.strip().casefold()
-            and posicion_existente.casefold() == posicion.strip().casefold()
+            and posicion_existente.casefold() == posicion_excel.casefold()
         ):
             ws.delete_rows(fila, 1)
             wb.save(archivo)
@@ -1098,15 +1212,25 @@ def _editar_articulo_excel(nombre_original, ubicacion_original, posicion_origina
                             posicion_nueva):
     """Edita nombre, cantidad, ubicación y posición de un artículo."""
     cantidad_nueva = int(cantidad_nueva)
+    posicion_original_excel = posicion_para_excel(posicion_original)
+    posicion_nueva_excel = posicion_para_excel(posicion_nueva)
     if cantidad_nueva < 1:
         return False, "La cantidad debe ser mayor que 0."
 
-    wb = load_workbook(archivo)
+    contexto_origen = contexto_ubicacion(ubicacion_original, posicion_original)
+    contexto_destino = contexto_ubicacion(ubicacion_nueva, posicion_nueva)
+    if not contexto_origen or not contexto_destino:
+        return False, "No se ha encontrado alguna de las ubicaciones."
 
-    if ubicacion_original not in wb.sheetnames:
-        return False, "No se ha encontrado la ubicación original."
+    archivo_origen, hoja_origen = contexto_origen
+    archivo_destino, hoja_destino = contexto_destino
 
-    ws_origen = wb[ubicacion_original]
+    # Si origen y destino están en archivos distintos, trabajamos con ambos.
+    wb = load_workbook(archivo_origen)
+    if hoja_origen not in wb.sheetnames:
+        return False, "No se ha encontrado la hoja de la ubicación original."
+
+    ws_origen = wb[hoja_origen]
 
     encabezados = {}
     for celda in ws_origen[1]:
@@ -1117,6 +1241,7 @@ def _editar_articulo_excel(nombre_original, ubicacion_original, posicion_origina
     col_posicion = (
         encabezados.get("Nº balda")
         or encabezados.get("Lugar")
+        or encabezados.get("Nº cajón")
         or encabezados.get("Unnamed: 0")
     )
     col_cantidad = encabezados.get("Cantidad") or encabezados.get("Nº de cajas")
@@ -1134,7 +1259,7 @@ def _editar_articulo_excel(nombre_original, ubicacion_original, posicion_origina
 
         if (
             nombre_existente.casefold() == nombre_original.strip().casefold()
-            and posicion_existente.casefold() == posicion_original.strip().casefold()
+            and posicion_existente.casefold() == posicion_original_excel.casefold()
         ):
             fila_encontrada = fila
             break
@@ -1142,15 +1267,18 @@ def _editar_articulo_excel(nombre_original, ubicacion_original, posicion_origina
     if fila_encontrada is None:
         return False, "No se ha podido localizar el artículo en el Excel."
 
-    # Si cambia de ubicación, copiamos la fila completa a la nueva hoja
-    # y después eliminamos la original.
-    if ubicacion_nueva != ubicacion_original:
-        if ubicacion_nueva not in wb.sheetnames:
-            wb.create_sheet(ubicacion_nueva)
+    # Si cambia de ubicación, copiamos la fila a la hoja/Excel de destino.
+    if (archivo_destino, hoja_destino) != (archivo_origen, hoja_origen):
+        if archivo_destino == archivo_origen:
+            wb_destino = wb
+        else:
+            wb_destino = load_workbook(archivo_destino)
 
-        ws_destino = wb[ubicacion_nueva]
+        if hoja_destino not in wb_destino.sheetnames:
+            return False, "No se ha encontrado la hoja de la nueva ubicación."
 
-        # El destino puede tener una estructura distinta. Detectamos sus columnas.
+        ws_destino = wb_destino[hoja_destino]
+
         encabezados_destino = {}
         for celda in ws_destino[1]:
             if celda.value is not None:
@@ -1163,6 +1291,7 @@ def _editar_articulo_excel(nombre_original, ubicacion_original, posicion_origina
         col_posicion_dest = (
             encabezados_destino.get("Nº balda")
             or encabezados_destino.get("Lugar")
+            or encabezados_destino.get("Nº cajón")
             or encabezados_destino.get("Unnamed: 0")
         )
         col_cantidad_dest = (
@@ -1174,46 +1303,39 @@ def _editar_articulo_excel(nombre_original, ubicacion_original, posicion_origina
             return False, "La nueva ubicación no tiene una estructura compatible."
 
         nueva_fila = ws_destino.max_row + 1
-
-        # Copiar valores de la fila original manteniendo la estructura de la hoja destino.
-        nombre_col_origen = col_nombre
-        posicion_col_origen = col_posicion
-        cantidad_col_origen = col_cantidad
-
-        ws_destino.cell(nueva_fila, col_nombre_dest).value = nombre_nuevo.strip()
-        ws_destino.cell(nueva_fila, col_cantidad_dest).value = cantidad_nueva
-
-        if col_posicion_dest:
-            ws_destino.cell(nueva_fila, col_posicion_dest).value = posicion_nueva.strip()
-
-        # Copiar columnas adicionales por nombre cuando existen en ambos sitios.
-        for nombre_columna, col_dest in encabezados_destino.items():
-            if nombre_columna in encabezados:
-                ws_destino.cell(nueva_fila, col_dest).value = ws_origen.cell(
-                    fila_encontrada, encabezados[nombre_columna]
-                ).value
-
-        # Volvemos a imponer los valores editados para que no sean sobreescritos.
         ws_destino.cell(nueva_fila, col_nombre_dest).value = nombre_nuevo.strip()
         ws_destino.cell(nueva_fila, col_cantidad_dest).value = cantidad_nueva
         if col_posicion_dest:
-            ws_destino.cell(nueva_fila, col_posicion_dest).value = posicion_nueva.strip()
+            ws_destino.cell(nueva_fila, col_posicion_dest).value = posicion_nueva_excel
 
-        ws_origen.delete_rows(fila_encontrada, 1)
+        if archivo_destino == archivo_origen:
+            ws_origen.delete_rows(fila_encontrada, 1)
+            wb.save(archivo_origen)
+        else:
+            ws_origen.delete_rows(fila_encontrada, 1)
+            wb.save(archivo_origen)
+            wb_destino.save(archivo_destino)
 
     else:
         ws_origen.cell(fila_encontrada, col_nombre).value = nombre_nuevo.strip()
         ws_origen.cell(fila_encontrada, col_cantidad).value = cantidad_nueva
-
         if col_posicion:
-            ws_origen.cell(fila_encontrada, col_posicion).value = posicion_nueva.strip()
+            ws_origen.cell(fila_encontrada, col_posicion).value = posicion_nueva_excel
+        wb.save(archivo_origen)
 
-    wb.save(archivo)
     return True, "Artículo actualizado correctamente."
 
 
 def _registrar_entrada_excel(proveedor, pedido, fecha_entrada, articulos):
-    """Guarda el historial de una entrada en una hoja independiente."""
+    """Guarda el historial de una entrada en el Excel de la ubicación."""
+    if not articulos:
+        return
+
+    contexto = contexto_ubicacion(articulos[0]["ubicacion"], articulos[0]["posicion"])
+    if not contexto:
+        return
+
+    archivo, _ = contexto
     wb = load_workbook(archivo)
 
     nombre_hoja = "Entradas"
@@ -1309,7 +1431,7 @@ if panel_gestion == "articulo":
         with c3:
             ubicacion_nueva = st.selectbox(
                 "Ubicación",
-                excel.sheet_names
+                list(UBICACIONES_A_ARCHIVO.keys())
             )
 
         posiciones_nuevas = sorted([
@@ -1327,8 +1449,9 @@ if panel_gestion == "articulo":
         if opcion_posicion == "Nueva posición...":
             posicion_nueva = st.text_input(
                 "Escribe la nueva posición",
-                placeholder="Ejemplo: Balda 5 - fila 2"
+                placeholder="Ejemplo: Armario 1 | Balda 5 - fila 2"
             )
+            st.caption("En una sala con varias zonas, escribe: Zona | posición")
         else:
             posicion_nueva = opcion_posicion
 
@@ -1346,7 +1469,7 @@ if panel_gestion == "articulo":
             st.error("Indica una posición.")
 
         else:
-            _guardar_articulo_excel(
+            resultado_guardado = _guardar_articulo_excel(
                 nombre_nuevo,
                 cantidad_nueva,
                 unidad_nueva,
@@ -1354,11 +1477,14 @@ if panel_gestion == "articulo":
                 posicion_nueva
             )
 
-            st.success(
-                f"Artículo **{nombre_nuevo.strip()}** añadido al inventario."
-            )
-            st.session_state["panel_gestion"] = ""
-            st.rerun()
+            if resultado_guardado in ("error_ubicacion", "error"):
+                st.error("No se ha podido determinar la zona. Escribe la posición con el formato: Zona | posición")
+            else:
+                st.success(
+                    f"Artículo **{nombre_nuevo.strip()}** añadido al inventario."
+                )
+                st.session_state["panel_gestion"] = ""
+                st.rerun()
 
 
 elif panel_gestion == "entrada":
@@ -1419,7 +1545,7 @@ elif panel_gestion == "entrada":
         with c6:
             ubicacion_entrada = st.selectbox(
                 "Ubicación",
-                excel.sheet_names
+                list(UBICACIONES_A_ARCHIVO.keys())
             )
 
         posiciones_entrada = sorted([
@@ -1437,8 +1563,9 @@ elif panel_gestion == "entrada":
         if opcion_posicion_entrada == "Nueva posición...":
             posicion_entrada = st.text_input(
                 "Escribe la nueva posición",
-                placeholder="Ejemplo: Balda 5 - fila 2"
+                placeholder="Ejemplo: Armario 1 | Balda 5 - fila 2"
             )
+            st.caption("En una sala con varias zonas, escribe: Zona | posición")
         else:
             posicion_entrada = opcion_posicion_entrada
 
@@ -1563,10 +1690,10 @@ elif panel_gestion == "gestionar":
             with e2:
                 ubicacion_editada = st.selectbox(
                     "Ubicación",
-                    excel.sheet_names,
+                    list(UBICACIONES_A_ARCHIVO.keys()),
                     index=(
-                        excel.sheet_names.index(seleccionado["Ubicación"])
-                        if seleccionado["Ubicación"] in excel.sheet_names else 0
+                        list(UBICACIONES_A_ARCHIVO.keys()).index(seleccionado["Ubicación"])
+                        if seleccionado["Ubicación"] in list(UBICACIONES_A_ARCHIVO.keys()) else 0
                     ),
                     key="ubicacion_editada"
                 )
@@ -1711,7 +1838,7 @@ busqueda = st.text_input(
 
 ubicacion = st.selectbox(
     "📍 Filtrar por ubicación:",
-    ["Todas"] + excel.sheet_names
+    ["Todas"] + list(UBICACIONES_A_ARCHIVO.keys())
 )
 
 
